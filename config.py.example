@@ -1,0 +1,32 @@
+
+import os
+from datetime import datetime
+
+if "RUN_TIMESTAMP" in os.environ:
+	RUN_TIMESTAMP = os.environ["RUN_TIMESTAMP"]
+else:
+	RUN_TIMESTAMP = datetime.now().strftime("%y%m%d_%H%M%S")
+
+OUTPUT_DIR = "output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+TESTS_OUTPUT_PATH = os.path.join(OUTPUT_DIR, f"tests_output_{RUN_TIMESTAMP}.md")
+DELTA_IMAGE_PATH = os.path.join(OUTPUT_DIR, f"delta_chart_{RUN_TIMESTAMP}.png")
+
+# Add your TestRail and Confluence credentials here
+TESTRAIL_URL = "https://BLA.testrail.io"
+USERNAME = "petr.knyttl@bla.bla"
+API_KEY = ""
+RUN_IDS = [224, 225, 226, 227]
+MILESTONE_IDS = [17, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 49, 50, 51, 52, 53,54]
+PROJECT_ID = 7 #- required for listing milestones via /get_milestones/{project_id}
+
+
+# === Confluence Configuration ===
+CONFLUENCE_USERNAME = "petr.knyttl@BLA.BLA"
+CONFLUENCE_API_TOKEN = ""
+CONFLUENCE_BASE_URL = "https://BLA.atlassian.net/wiki"
+CONFLUENCE_API_URL = "https://BLA.atlassian.net/wiki/rest/api"
+CONFLUENCE_SPACE = "OOO"
+CONFLUENCE_PARENT_PAGE_ID = "148799489"
+CONFLUENCE_PAGE_ID = "148799489"
