@@ -39,7 +39,7 @@ def make_chart_png_bytes(dates: Sequence[str],
                          cumulative_values: Sequence[int],
                          width: float = 10,
                          height: float = 5,
-                         dpi: int = 140,
+                         dpi: int = 100, #this controls the resolution of the output image (width*height*dpi^2)
                          title: Optional[str] = None) -> bytes:
     if not (len(dates) == len(daily_values) == len(cumulative_values)):
         raise ValueError("dates, daily_values and cumulative_values must have the same length")
@@ -47,7 +47,7 @@ def make_chart_png_bytes(dates: Sequence[str],
     fig, ax = plt.subplots(figsize=(width, height))
     if title:
         ax.set_title(title, fontsize=12, weight="bold")
-    bars = ax.bar(x, daily_values, color="#4C78A8", label="Daily executed (first-executed)")
+    bars = ax.bar(x, daily_values, color="#0089b6", label="Daily executed (first-executed)")
     ax.plot(x, cumulative_values, color="#F58518", marker="o", linewidth=2, label="Cumulative (as of day)")
     ax.set_yticks([])
     for rect, val, xi, cumv in zip(bars, daily_values, x, cumulative_values):

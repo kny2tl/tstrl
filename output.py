@@ -4,20 +4,18 @@ output.py
 
 Assemble final HTML report from omni-produced JSONs, milestones, and per-plan velocity charts.
 
-Changes for "no global chart":
-- The script no longer expects or embeds a global velocity chart.
-- It includes per-plan charts only (results_plan_*.json).
-- Still produces milestone table and runs summary from results.json.
-- Copies per-plan PNGs into the report output dir and embeds them.
-- Output filename: report_<YYYYMMDD>_<HHMMSS>.html (UTC)
-- CLI: --omni-script, --results-json, --output-dir, --skip-omni, --verbose, --milestone-json
+This version restores the Milestones table into the final HTML and keeps:
+- grouped runs table (base run name grouping) with a single GRAND TOTAL
+- per-plan charts only (no global chart)
+- report filename report_<YYYYMMDD>_<HHMMSS>.html (UTC)
+- --skip-omni behavior and chart generation fallback
 """
 from __future__ import annotations
 
 import sys
 import subprocess
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List
 import argparse
 import logging
 import json
@@ -25,8 +23,9 @@ import os
 from html import escape
 from datetime import datetime, timezone
 import shutil
+import ast
 
-# optional plan config
+# optional config-driven plan sets/ids
 try:
     from config import CHART_PLAN_SETS  # type: ignore
 except Exception:
@@ -61,19 +60,13 @@ def _run_omni_subprocess(omni_script: Path, extra_args: Optional[list] = None) -
 
 
 def _generate_charts_for_jsons(results_dir: Path, json_files: List[str], verbose: bool = False) -> None:
-    """
-    Generate charts by invoking chart_generator.py for each per-plan JSON.
-    Skip if chart_generator.py is not present.
-    """
     chart_script = Path(__file__).resolve().parent / "chart_generator.py"
     if not chart_script.exists():
         logger.warning("chart_generator not available; skipping chart generation")
         return
-
     repo = str(Path(__file__).resolve().parent)
     env = os.environ.copy()
     env["PYTHONPATH"] = repo + (os.pathsep + env.get("PYTHONPATH", ""))
-
     for jf in json_files:
         jpath = results_dir / jf
         if not jpath.exists():
@@ -108,9 +101,6 @@ def _load_json_safe(path: Path) -> Optional[dict]:
 
 
 def _normalize_plan_ids_from_config() -> List[int]:
-    """
-    Return ordered list of plan IDs based on CHART_PLAN_SETS or CHART_PLAN_IDS in config.
-    """
     plan_ids: List[int] = []
     try:
         if CHART_PLAN_SETS:
@@ -145,7 +135,6 @@ def _normalize_plan_ids_from_config() -> List[int]:
 
 def _collect_per_plan_jsons(results_json: Path) -> List[Path]:
     results_dir = results_json.parent if results_json.parent != Path("") else Path(".")
-    # Return per-plan JSONs ordered by config then alphabetically for remaining
     files: List[Path] = []
     plan_ids = _normalize_plan_ids_from_config()
     for pid in plan_ids:
@@ -159,14 +148,11 @@ def _collect_per_plan_jsons(results_json: Path) -> List[Path]:
 
 
 def _discover_per_plan_charts(repo_output_dir: Path, run_output_dir: Path) -> List[Path]:
-    """
-    Discover per-plan PNG charts (delta_<planid>_*.png) from repo/output and results_dir/output.
-    Return unique Paths.
-    """
     found = []
     for d in (repo_output_dir, run_output_dir):
         if not d or not d.exists():
             continue
+        # per-plan charts are named delta_<planid>_YYYYMMDD_HHMMSS.png
         found.extend(sorted(d.glob("delta_*_*.png"), key=lambda p: p.name))
     seen = set()
     unique = []
@@ -177,19 +163,15 @@ def _discover_per_plan_charts(repo_output_dir: Path, run_output_dir: Path) -> Li
             unique.append(p)
     return unique
 
+
 def _classify_plan_chart(p: Path) -> Optional[int]:
-    """
-    If chart filename indicates a plan id (delta_<planid>_YYYYMMDD_... or delta_<planid>_...), return planid.
-    Treat an 8-digit numeric second token as a date (global candidate) and NOT as a plan id.
-    """
     stem = p.stem
     parts = stem.split("_")
     if len(parts) >= 3 and parts[0] == "delta":
         token = parts[1]
-        # token that looks like YYYYMMDD -> treat as date (global), not plan id
+        # treat 8-digit token as date (not plan id)
         if token.isdigit() and len(token) == 8:
             return None
-        # otherwise, if token is numeric (likely plan id), return it
         if token.isdigit():
             try:
                 return int(token)
@@ -197,25 +179,20 @@ def _classify_plan_chart(p: Path) -> Optional[int]:
                 return None
     return None
 
+
 def _order_per_plan_charts(chart_paths: List[Path], results_json: Path) -> List[Path]:
-    """
-    Order per-plan charts by CHART_PLAN_SETS/CHART_PLAN_IDS, then remaining by plan id order.
-    """
     plan_ids = _normalize_plan_ids_from_config()
     by_plan = {}
     for p in chart_paths:
         pid = _classify_plan_chart(p)
         if pid is None:
-            # skip non-per-plan charts (global) - we intentionally do not include global charts
             continue
         by_plan.setdefault(int(pid), []).append(p)
-
     ordered = []
     for pid in plan_ids:
         lst = by_plan.pop(pid, [])
         if lst:
-            ordered.append(sorted(lst, key=lambda x: x.name)[-1])  # take latest for plan
-    # remaining plans sorted by numeric plan id
+            ordered.append(sorted(lst, key=lambda x: x.name)[-1])
     for pid in sorted(by_plan.keys()):
         lst = by_plan[pid]
         ordered.append(sorted(lst, key=lambda x: x.name)[-1])
@@ -223,9 +200,6 @@ def _order_per_plan_charts(chart_paths: List[Path], results_json: Path) -> List[
 
 
 def _copy_charts_to_report_dir(charts: List[Path], report_dir: Path) -> List[Path]:
-    """
-    Copy chart files into report_dir (overwriting same-named files), returning list of copied Paths in report_dir.
-    """
     report_dir.mkdir(parents=True, exist_ok=True)
     copied = []
     for p in charts:
@@ -245,15 +219,28 @@ def _copy_charts_to_report_dir(charts: List[Path], report_dir: Path) -> List[Pat
     return copied
 
 
-def _render_milestone_table_html(milestone_json: Optional[Path]) -> str:
+def _render_milestone_table_html(milestone_source: Optional[object]) -> str:
     """
-    Robust milestone renderer that handles stringified Python lists and various shapes.
+    Render milestone table.
+    milestone_source may be:
+      - a Path to a JSON file
+      - a dict/list object already loaded from results.json
+      - None
+    This function normalizes common shapes and stringified Python lists.
     """
     import ast
 
-    if not milestone_json or not milestone_json.exists():
-        return "<div class=\"milestone-intro\">No milestone data available.</div>"
-    data = _load_json_safe(milestone_json)
+    # Load data if a Path was passed
+    data = None
+    if isinstance(milestone_source, Path):
+        if not milestone_source.exists():
+            return "<div class=\"milestone-intro\">No milestone data available.</div>"
+        data = _load_json_safe(milestone_source)
+        if not data:
+            return "<div class=\"milestone-intro\">No milestone data available.</div>"
+    else:
+        data = milestone_source
+
     if not data:
         return "<div class=\"milestone-intro\">No milestone data available.</div>"
 
@@ -261,17 +248,20 @@ def _render_milestone_table_html(milestone_json: Optional[Path]) -> str:
     if isinstance(data, list):
         entries = data
     elif isinstance(data, dict):
-        if "milestones" in data and isinstance(data["milestones"], (list, str)):
-            entries = data["milestones"]
-        elif "items" in data and isinstance(data["items"], (list, str)):
-            entries = data["items"]
-        else:
+        # first look for explicit keys
+        for key in ("milestones", "items", "data", "results"):
+            if key in data and isinstance(data[key], (list, str)):
+                entries = data[key]
+                break
+        if entries is None:
+            # look for first list-valued entry
             for v in data.values():
                 if isinstance(v, list):
                     entries = v
                     break
+            # fallback: stringified list inside a value
             if entries is None:
-                for k, v in data.items():
+                for v in data.values():
                     if isinstance(v, str) and v.strip().startswith("["):
                         try:
                             parsed = ast.literal_eval(v)
@@ -280,32 +270,36 @@ def _render_milestone_table_html(milestone_json: Optional[Path]) -> str:
                                 break
                         except Exception:
                             continue
+    elif isinstance(data, str):
+        # stringified list at top level
+        txt = data.strip()
+        if txt.startswith("["):
+            try:
+                parsed = ast.literal_eval(txt)
+                if isinstance(parsed, list):
+                    entries = parsed
+            except Exception:
+                entries = [txt]
+        else:
+            entries = [data]
 
     if isinstance(entries, str):
-        txt = entries.strip()
+        # parse stringified list
         try:
-            parsed = ast.literal_eval(txt)
+            parsed = ast.literal_eval(entries)
             if isinstance(parsed, list):
                 entries = parsed
             else:
-                entries = [str(entries)]
+                entries = [entries]
         except Exception:
             entries = [entries]
-
-    if entries is None and isinstance(data, str):
-        try:
-            parsed = ast.literal_eval(data)
-            if isinstance(parsed, list):
-                entries = parsed
-        except Exception:
-            entries = [str(data)]
 
     if not entries:
         return "<div class=\"milestone-intro\">No milestone entries found.</div>"
 
+    # normalize and flatten
     if isinstance(entries, dict):
         entries = [entries]
-
     flat = []
     for e in entries:
         if isinstance(e, list):
@@ -316,6 +310,7 @@ def _render_milestone_table_html(milestone_json: Optional[Path]) -> str:
 
     rows = []
     for e in entries:
+        # if stringified dict, try to parse
         if isinstance(e, str) and e.strip().startswith("{"):
             try:
                 parsed = ast.literal_eval(e)
@@ -327,7 +322,6 @@ def _render_milestone_table_html(milestone_json: Optional[Path]) -> str:
         if isinstance(e, str):
             rows.append(f"<tr class=''><td>{escape(e)}</td><td class=''></td><td></td><td></td></tr>")
             continue
-
         if not isinstance(e, dict):
             rows.append(f"<tr class=''><td>{escape(str(e))}</td><td class=''></td><td></td><td></td></tr>")
             continue
@@ -355,13 +349,35 @@ def _render_milestone_table_html(milestone_json: Optional[Path]) -> str:
     tbl += "</table>"
     return tbl
 
-
 def _render_runs_table_html(global_json: Optional[dict]) -> str:
+    def pct(numer: int, denom: int) -> str:
+        return f"{(numer/denom*100):.1f}%" if denom else "0.0%"
+
     if not global_json:
         return "<p class='placeholder'>No runs summary available.</p>"
 
     rows = global_json.get("rows") or []
-    grand = global_json.get("grand") or {}
+    if not rows:
+        return "<p class='placeholder'>No runs summary available.</p>"
+
+    def base_name_from_row(r: dict) -> str:
+        lbl = str(r.get("run_label") or r.get("run_name") or "").strip()
+        if not lbl:
+            rid = r.get("run_id")
+            return f"Run {rid}" if rid is not None else "Unnamed Run"
+        for sep in (" [", " ("):
+            if sep in lbl:
+                return lbl.split(sep, 1)[0].strip()
+        return lbl
+
+    groups = {}
+    order = []
+    for r in rows:
+        base = base_name_from_row(r)
+        if base not in groups:
+            groups[base] = []
+            order.append(base)
+        groups[base].append(r)
 
     thead = (
         "<thead><tr><th rowspan='3'>Run Name [Configuration]</th><th rowspan='3'>Planned</th><th colspan='2'>Executed</th>"
@@ -371,65 +387,73 @@ def _render_runs_table_html(global_json: Optional[dict]) -> str:
     )
 
     body_rows = []
-    plan_name = global_json.get("plan_name")
-    if plan_name:
-        body_rows.append(f"<tr><td class='group-sep' colspan='11'>Plan: {escape(str(plan_name))}</td></tr>")
+    total_planned_all = total_executed_all = total_passed_all = total_failed_all = 0
 
-    for r in rows:
-        run_label = escape(str(r.get("run_label") or r.get("run_name") or f"Run {r.get('run_id','')}"))
-        planned = int(r.get("planned", 0))
-        executed = int(r.get("executed", 0))
-        passed = int(r.get("passed", 0))
-        failed = int(r.get("failed", 0))
-        not_exec = int(r.get("not_executed", max(0, planned - executed)))
-        executed_pct = f"{(executed / planned * 100):.1f}%" if planned else "0.0%"
-        not_exec_pct = f"{(not_exec / planned * 100):.1f}%" if planned else "0.0%"
-        passed_pct = f"{(passed / executed * 100):.1f}%" if executed else "0.0%"
-        failed_pct = f"{(failed / executed * 100):.1f}%" if executed else "0.0%"
+    for base in order:
+        group_rows = groups.get(base, [])
+        g_planned = sum(int(r.get("planned", 0)) for r in group_rows)
+        g_executed = sum(int(r.get("executed", 0)) for r in group_rows)
+        g_passed = sum(int(r.get("passed", 0)) for r in group_rows)
+        g_failed = sum(int(r.get("failed", 0)) for r in group_rows)
+        g_not_exec = max(0, g_planned - g_executed)
+
+        total_planned_all += g_planned
+        total_executed_all += g_executed
+        total_passed_all += g_passed
+        total_failed_all += g_failed
+
+        group_label = f"{base} Total"
         body_rows.append(
-            "<tr>"
-            f"<td class='left'>{run_label}</td>"
-            f"<td>{planned}</td>"
-            f"<td>{executed_pct}</td><td>{executed}</td>"
-            f"<td>{not_exec_pct}</td><td>{not_exec}</td>"
+            "<tr class='group-totals'>"
+            f"<td class='left'>{escape(group_label)}</td>"
+            f"<td>{g_planned}</td>"
+            f"<td>{pct(g_executed, g_planned)}</td><td>{g_executed}</td>"
+            f"<td>{pct(g_not_exec, g_planned)}</td><td>{g_not_exec}</td>"
             "<td class='gap'></td>"
-            f"<td>{passed_pct}</td><td>{passed}</td><td>{failed_pct}</td><td>{failed}</td>"
+            f"<td>{pct(g_passed, g_executed)}</td><td>{g_passed}</td><td>{pct(g_failed, g_executed)}</td><td>{g_failed}</td>"
             "</tr>"
         )
 
-    grand_planned = int(grand.get("Planned", sum(int(r.get("planned", 0)) for r in rows)))
-    grand_executed = int(grand.get("Executed", sum(int(r.get("executed", 0)) for r in rows)))
-    grand_not_exec = int(grand.get("Not Executed", max(0, grand_planned - grand_executed)))
-    grand_passed = int(grand.get("Passed", sum(int(r.get("passed", 0)) for r in rows)))
-    grand_failed = int(grand.get("Failed", sum(int(r.get("failed", 0)) for r in rows)))
-    grand_executed_pct = f"{(grand_executed / grand_planned * 100):.1f}%" if grand_planned else "0.0%"
-    grand_not_exec_pct = f"{(grand_not_exec / grand_planned * 100):.1f}%" if grand_planned else "0.0%"
-    grand_passed_pct = f"{(grand_passed / grand_executed * 100):.1f}%" if grand_executed else "0.0%"
-    grand_failed_pct = f"{(grand_failed / grand_executed * 100):.1f}%" if grand_executed else "0.0%"
+        for r in group_rows:
+            run_label = escape(str(r.get("run_label") or r.get("run_name") or f"Run {r.get('run_id','')}"))
+            planned = int(r.get("planned", 0))
+            executed = int(r.get("executed", 0))
+            passed = int(r.get("passed", 0))
+            failed = int(r.get("failed", 0))
+            not_exec = int(r.get("not_executed", max(0, planned - executed)))
+            body_rows.append(
+                "<tr>"
+                f"<td class='left'>{run_label}</td>"
+                f"<td>{planned}</td>"
+                f"<td>{pct(executed, planned)}</td><td>{executed}</td>"
+                f"<td>{pct(not_exec, planned)}</td><td>{not_exec}</td>"
+                "<td class='gap'></td>"
+                f"<td>{pct(passed, executed)}</td><td>{passed}</td><td>{pct(failed, executed)}</td><td>{failed}</td>"
+                "</tr>"
+            )
 
-    totals_row = (
-        "<tr class='group-totals'><td class='left'><strong>TOTAL</strong></td>"
-        f"<td>{grand_planned}</td><td>{grand_executed_pct}</td><td>{grand_executed}</td>"
-        f"<td>{grand_not_exec_pct}</td><td>{grand_not_exec}</td><td class='gap'></td>"
-        f"<td>{grand_passed_pct}</td><td>{grand_passed}</td><td>{grand_failed_pct}</td><td>{grand_failed}</td></tr>"
-    )
+    grand_planned = total_planned_all
+    grand_executed = total_executed_all
+    grand_not_exec = max(0, grand_planned - grand_executed)
+    grand_passed = total_passed_all
+    grand_failed = total_failed_all
+
+    grand_executed_pct = pct(grand_executed, grand_planned)
+    grand_not_exec_pct = pct(grand_not_exec, grand_planned)
+    grand_passed_pct = pct(grand_passed, grand_executed)
+    grand_failed_pct = pct(grand_failed, grand_executed)
+
     grand_row = (
         f"<tr class='grand'><td class='left'>GRAND TOTAL</td><td>{grand_planned}</td><td>{grand_executed_pct}</td><td>{grand_executed}</td>"
         f"<td>{grand_not_exec_pct}</td><td>{grand_not_exec}</td><td class='gap'></td><td>{grand_passed_pct}</td><td>{grand_passed}</td><td>{grand_failed_pct}</td><td>{grand_failed}</td></tr>"
     )
 
-    tbody = "<tbody>" + "".join(body_rows) + totals_row + grand_row + "</tbody>"
+    tbody = "<tbody>" + "".join(body_rows) + grand_row + "</tbody>"
     table = f"<table class='runs-table' role='table' aria-label='Runs table grouped by plan'>{thead}{tbody}</table>"
     return table
 
-def _render_per_plan_charts_html(report_output_dir: Path, results_json: Path) -> str:
-    """
-    Find per-plan charts, order them per config and per-plan id, copy into report_output_dir,
-    and return concatenated HTML snippets for each chart.
 
-    Titles: prefer plan name from the corresponding results_plan_<id>.json (if present), else
-    "Plan <id> velocity".
-    """
+def _render_per_plan_charts_html(report_output_dir: Path, results_json: Path) -> str:
     repo_output_dir = Path(__file__).resolve().parent / "output"
     run_output_dir = results_json.parent / "output"
     discovered = _discover_per_plan_charts(repo_output_dir, run_output_dir)
@@ -439,8 +463,7 @@ def _render_per_plan_charts_html(report_output_dir: Path, results_json: Path) ->
     ordered = _order_per_plan_charts(discovered, results_json)
     copied = _copy_charts_to_report_dir(ordered, report_output_dir)
 
-    parts = []
-    # Preload plan name mapping from results_plan_<id>.json files
+    # map plan id to plan name if available
     plan_name_map = {}
     results_dir = results_json.parent if results_json.parent != Path("") else Path(".")
     for pjson in results_dir.glob("results_plan_*.json"):
@@ -448,7 +471,6 @@ def _render_per_plan_charts_html(report_output_dir: Path, results_json: Path) ->
             obj = _load_json_safe(pjson) or {}
             pid = obj.get("plan_id")
             if pid is None:
-                # try to extract id from filename
                 name = pjson.name
                 if name.startswith("results_plan_") and name.endswith(".json"):
                     try:
@@ -462,21 +484,21 @@ def _render_per_plan_charts_html(report_output_dir: Path, results_json: Path) ->
         except Exception:
             continue
 
+    parts = []
     for p in copied:
         pid = _classify_plan_chart(p)
         title = None
         if pid is not None:
-            # prefer readable plan name from mapping
             pname = plan_name_map.get(int(pid))
             if pname:
                 title = f"{pname}, plan #{pid}"
             else:
                 title = f"Plan {pid} velocity"
         else:
-            # Should not happen for per-plan chart flow, but handle gracefully
             title = "Plan velocity"
         parts.append(f"<div class='chart'><h3>{escape(title)}</h3><img class='chart-img' alt='{escape(title)}' src='{escape(p.name)}' /></div>")
     return "\n".join(parts)
+
 
 def _assemble_html_file(output_dir: Path, results_json: Path, milestone_json: Optional[Path] = None) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -564,7 +586,6 @@ def main(argv: Optional[list] = None) -> int:
     output_dir = Path(args.output_dir)
     milestone_json = Path(args.milestone_json) if args.milestone_json else None
 
-    # Optionally refresh data
     if not args.skip_omni and args.omni_script:
         rc = _run_omni_subprocess(Path(args.omni_script), extra_args=[f"--json-out={str(results_json)}"])
         if rc != 0:
@@ -574,7 +595,6 @@ def main(argv: Optional[list] = None) -> int:
         if args.skip_omni:
             logger.info("Skipping omni run as requested (--skip-omni)")
 
-    # Generate per-plan charts (or no-op if orchestrator already created them)
     per_plan = _collect_per_plan_jsons(results_json)
     json_names = [p.name for p in per_plan]
     _generate_charts_for_jsons(results_json.parent, json_names, verbose=args.verbose)
