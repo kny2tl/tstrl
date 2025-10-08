@@ -39,7 +39,7 @@ def make_chart_png_bytes(dates: Sequence[str],
                          cumulative_values: Sequence[int],
                          width: float = 10,
                          height: float = 5,
-                         dpi: int = 100, #this controls the resolution of the output image (width*height*dpi^2)
+                         dpi: int = 100, #this controls the resolution of the output image (width
                          title: Optional[str] = None) -> bytes:
     if not (len(dates) == len(daily_values) == len(cumulative_values)):
         raise ValueError("dates, daily_values and cumulative_values must have the same length")

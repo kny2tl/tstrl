@@ -2,13 +2,12 @@
 """
 orchestrator.py
 
-Run the full pipeline end-to-end without requiring CLI to specify JSON paths.
-Behavior:
-- Runs omni to produce results.json in the repo root
-- Runs table_milestones.py (import/main preferred) to create milestone_data.json next to results.json
-- Generates per-plan charts (chart_generator.py) for results_plan_*.json (no global chart)
-- Runs output.py with --skip-omni and passes the discovered results.json, milestone_data.json, and output dir
-- All subprocesses are invoked with PYTHONPATH set to the repo so local imports work
+Run pipeline and append Jira tables to the final HTML report.
+
+Behavior changes:
+- Removes lines beginning with "Generated:" (case-insensitive) from the final HTML before injection
+- Appends two Jira tables and injects a scoped CSS block that limits milestone/test-run/all tables
+  to max-width: 800px while keeping them responsive.
 """
 from __future__ import annotations
 
@@ -16,9 +15,12 @@ import sys
 import subprocess
 import logging
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Dict, Any
 import importlib
 import os
+import json
+import html
+import re
 
 logger = logging.getLogger("orchestrator")
 _handler = logging.StreamHandler()
@@ -27,30 +29,27 @@ _handler.setFormatter(_formatter)
 logger.addHandler(_handler)
 logger.propagate = False
 
-
+# -------------------------
+# Pipeline runners (unchanged)
+# -------------------------
 def _run_omni() -> int:
-    """
-    Run omni to produce results.json in the repository root (default).
-    Try importing omni and calling main(); fall back to subprocess if import fails.
-    """
     repo_dir = Path(__file__).resolve().parent
-    args = ["--json-out", str(repo_dir / "results.json")]
+    out_path = repo_dir / "results.json"
+    args = ["--json-out", str(out_path)]
     try:
         omni = importlib.import_module("omni")
         if hasattr(omni, "main"):
             logger.info("Calling omni.main() directly")
             return omni.main(args)
     except Exception:
-        logger.debug("Import/inline omni failed; invoking as subprocess")
-
+        logger.debug("Import/inline omni failed; will use subprocess")
     omni_script = repo_dir / "omni.py"
     if not omni_script.exists():
         logger.error("omni.py not found at %s", omni_script)
         return 2
-    cmd = [sys.executable, str(omni_script), "--json-out", str(repo_dir / "results.json")]
+    cmd = [sys.executable, str(omni_script), "--json-out", str(out_path)]
     env = os.environ.copy()
     env["PYTHONPATH"] = str(repo_dir) + (os.pathsep + env.get("PYTHONPATH", ""))
-    logger.info("Running omni.py via subprocess: %s", " ".join(cmd))
     try:
         subprocess.run(cmd, check=True, env=env, cwd=repo_dir)
         return 0
@@ -58,21 +57,16 @@ def _run_omni() -> int:
         logger.error("omni.py subprocess failed: %s", e)
         return e.returncode
 
-
 def _discover_per_plan_jsons(results_dir: Path) -> List[Path]:
     return sorted(results_dir.glob("results_plan_*.json"))
 
-
 def _invoke_chart_generator_for_plan_json(json_path: Path) -> int:
-    """
-    Invoke chart_generator.py for a per-plan JSON.
-    """
     repo_dir = Path(__file__).resolve().parent
     chart_script = repo_dir / "chart_generator.py"
     if not chart_script.exists():
         logger.error("chart_generator.py not found at %s", chart_script)
         return 2
-    plan_id = None
+    plan_id: Optional[int] = None
     name = json_path.name
     if name.startswith("results_plan_") and name.endswith(".json"):
         try:
@@ -84,46 +78,27 @@ def _invoke_chart_generator_for_plan_json(json_path: Path) -> int:
         cmd += ["--plan-id", str(plan_id)]
     env = os.environ.copy()
     env["PYTHONPATH"] = str(repo_dir) + (os.pathsep + env.get("PYTHONPATH", ""))
-    logger.info("Running chart_generator for %s (plan_id=%s)", json_path.name, plan_id)
     try:
         subprocess.run(cmd, check=True, env=env, cwd=repo_dir)
-        logger.info("chart_generator succeeded for %s", json_path.name)
         return 0
     except subprocess.CalledProcessError as e:
         logger.error("chart_generator failed for %s: %s", json_path.name, e)
         return e.returncode
 
-
 def _run_table_milestone(results_dir: Path) -> Path:
-    """
-    Run table_milestones (prefer import & main()) and return Path to milestone JSON.
-
-    Attempts:
-      1) import table_milestones or table_milestone and call main(["--json-out", path])
-      2) fallback to subprocess on whichever script file exists using --json-out
-    Returns the expected milestone path (may not exist if the script failed).
-    """
     repo_dir = Path(__file__).resolve().parent
     milestone_out = results_dir / "milestone_data.json"
-
-    # 1) Try import-based invocation for both module name candidates
     for mod_name in ("table_milestones", "table_milestone"):
         try:
             mod = importlib.import_module(mod_name)
             if hasattr(mod, "main"):
-                logger.info("Invoking %s.main() directly", mod_name)
                 try:
-                    # call with explicit json-out flag
                     mod.main(["--json-out", str(milestone_out)])
                 except TypeError:
-                    # some mains may not accept args
                     mod.main()
-                logger.info("%s.main() completed; expected output at %s", mod_name, milestone_out)
                 return milestone_out
         except Exception:
             logger.debug("Import/call of %s failed; will try subprocess", mod_name)
-
-    # 2) Fallback to subprocess for candidate filenames
     candidates = [repo_dir / "table_milestones.py", repo_dir / "table_milestone.py"]
     for script in candidates:
         if not script.exists():
@@ -131,32 +106,48 @@ def _run_table_milestone(results_dir: Path) -> Path:
         cmd = [sys.executable, str(script), "--json-out", str(milestone_out)]
         env = os.environ.copy()
         env["PYTHONPATH"] = str(repo_dir) + (os.pathsep + env.get("PYTHONPATH", ""))
-        logger.info("Running table_milestone subprocess: %s", " ".join(cmd))
         try:
             subprocess.run(cmd, check=True, env=env, cwd=repo_dir)
-            if milestone_out.exists():
-                logger.info("table_milestone produced %s", milestone_out)
-            else:
-                logger.warning("table_milestone finished but %s not found", milestone_out)
             return milestone_out
         except subprocess.CalledProcessError as e:
             logger.warning("table_milestone subprocess failed for %s: %s", script.name, e)
-
-    logger.debug("No table_milestone script succeeded; returning expected path %s", milestone_out)
     return milestone_out
 
+def _run_table_jira(results_dir: Path) -> Path:
+    repo_dir = Path(__file__).resolve().parent
+    jira_out = results_dir / "jira_counts.json"
+    try:
+        mod = importlib.import_module("table_jira")
+        if hasattr(mod, "main"):
+            try:
+                return_code = mod.main(["--json-out", str(jira_out)])
+                if return_code not in (None, 0):
+                    logger.warning("table_jira.main() returned exit code %s", return_code)
+                return jira_out
+            except TypeError:
+                mod.main()
+                return jira_out
+    except Exception:
+        logger.debug("Import/inline table_jira failed; will try subprocess")
+    script = repo_dir / "table_jira.py"
+    if not script.exists():
+        logger.error("table_jira.py not found at %s", script)
+        return jira_out
+    cmd = [sys.executable, str(script), "--json-out", str(jira_out)]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(repo_dir) + (os.pathsep + env.get("PYTHONPATH", ""))
+    try:
+        subprocess.run(cmd, check=True, env=env, cwd=repo_dir)
+        return jira_out
+    except subprocess.CalledProcessError as e:
+        logger.error("table_jira subprocess failed: %s", e)
+        return jira_out
 
 def _run_output(results_json: Path, output_dir: Path, milestone_json: Path) -> int:
-    """
-    Run output.py to assemble final HTML. Prefer importing output and calling main, else subprocess.
-    Always pass --skip-omni to avoid double-running omni.
-    """
     repo_dir = Path(__file__).resolve().parent
-    # Try direct import
     try:
         output_mod = importlib.import_module("output")
         if hasattr(output_mod, "main"):
-            logger.info("Calling output.main() directly")
             args = [
                 "--results-json", str(results_json),
                 "--output-dir", str(output_dir),
@@ -165,13 +156,11 @@ def _run_output(results_json: Path, output_dir: Path, milestone_json: Path) -> i
             ]
             return output_mod.main(args)
     except Exception:
-        logger.debug("Import/inline output failed; invoking as subprocess")
-
+        logger.debug("Import/inline output failed; will use subprocess")
     output_script = repo_dir / "output.py"
     if not output_script.exists():
         logger.error("output.py not found at %s", output_script)
         return 2
-
     cmd = [
         sys.executable, str(output_script),
         "--results-json", str(results_json),
@@ -181,7 +170,6 @@ def _run_output(results_json: Path, output_dir: Path, milestone_json: Path) -> i
     ]
     env = os.environ.copy()
     env["PYTHONPATH"] = str(repo_dir) + (os.pathsep + env.get("PYTHONPATH", ""))
-    logger.info("Running output.py via subprocess: %s", " ".join(cmd))
     try:
         subprocess.run(cmd, check=True, env=env, cwd=repo_dir)
         return 0
@@ -189,64 +177,203 @@ def _run_output(results_json: Path, output_dir: Path, milestone_json: Path) -> i
         logger.error("output.py subprocess failed: %s", e)
         return e.returncode
 
+# -------------------------
+# Injection helpers (updated)
+# -------------------------
+def _find_latest_html(output_dir: Path) -> Optional[Path]:
+    html_files = list(output_dir.glob("*.html"))
+    if not html_files:
+        return None
+    latest = max(html_files, key=lambda p: p.stat().st_mtime)
+    return latest
 
+def _safe_int_str(v) -> str:
+    if v is None:
+        return ""
+    try:
+        return str(int(v))
+    except Exception:
+        return html.escape(str(v))
+
+def _ci_lookup(jira_data: Dict[str, Any], key: str):
+    if not isinstance(jira_data, dict):
+        return None
+    lower_key = key.lower()
+    for k, v in jira_data.items():
+        if isinstance(k, str) and k.lower() == lower_key:
+            return v
+    return None
+
+# Scoped CSS that aims to constrain milestone/test-run/all tables to 800px responsively.
+# It is intentionally specific and uses !important to override page rules that set table width to 100%.
+_SCOPED_CSS = (
+    "<style>\n"
+    "/* Orchestrator injected styles: constrain tables to 800px max and keep them responsive */\n"
+    ".orchestrator-jira-wrap, .orchestrator-jira-wrap table, .orchestrator-jira-wrap .milestone-table, .orchestrator-jira-wrap .test-run-table { max-width:800px !important; width:100% !important; box-sizing:border-box !important; }\n"
+    ".orchestrator-jira-wrap table{ table-layout:fixed !important; border-collapse:collapse !important; }\n"
+    ".orchestrator-jira-wrap th, .orchestrator-jira-wrap td { padding:8px !important; border:1px solid #ddd !important; overflow-wrap:break-word !important; word-break:break-word !important; }\n"
+    ".orchestrator-jira-wrap thead th { background:#f2f2f2 !important; }\n"
+    ".orchestrator-jira-wrap thead tr + tr th { background:#f9f9f9 !important; }\n"
+    "</style>\n"
+)
+
+def _build_defects_count_fragment(jira_data: Dict[str, Any]) -> str:
+    opened_text = _safe_int_str(_ci_lookup(jira_data, "Highest+high Opened"))
+    resolved_text = _safe_int_str(_ci_lookup(jira_data, "Highest+high Resolved"))
+    frag = (
+        '\n<!-- BEGIN: Jira Defects table injected by orchestrator.py -->\n'
+        f'{_SCOPED_CSS}'
+        '<div class="orchestrator-jira-wrap">\n'
+        '  <section class="jira-defects">\n'
+        '    <table>\n'
+        '      <thead>\n'
+        '        <tr>\n'
+        '          <th colspan="2">Defects Count (Highest &amp; High)</th>\n'
+        '        </tr>\n'
+        '        <tr>\n'
+        '          <th>Opened</th>\n'
+        '          <th>Resolved</th>\n'
+        '        </tr>\n'
+        '      </thead>\n'
+        '      <tbody>\n'
+        f'        <tr><td>{opened_text}</td><td>{resolved_text}</td></tr>\n'
+        '      </tbody>\n'
+        '    </table>\n'
+        '  </section>\n'
+        '</div>\n'
+        '<!-- END: Jira Defects table injected by orchestrator.py -->\n'
+    )
+    return frag
+
+def _build_status_severity_fragment(jira_data: Dict[str, Any]) -> str:
+    mapping = [
+        ("To Do", "To Do Highest", "To Do High"),
+        ("In progress", "In Progress Highest", "In Progress High"),
+        ("In review", "In Review Highest", "In Review High"),
+        ("In testing", "In Testing Highest", "In Testing High"),
+        ("Blocked", "Blocked Highest", "Blocked High"),
+        ("All Resolved", "All Resolved Highest", "All Resolved High"),
+    ]
+    frag = (
+        '\n<!-- BEGIN: Jira Status x Severity table injected by orchestrator.py -->\n'
+        f'{_SCOPED_CSS}'
+        '<div class="orchestrator-jira-wrap">\n'
+        '  <section class="jira-status-severity">\n'
+        '    <table>\n'
+        '      <thead>\n'
+        '        <tr>\n'
+        '          <th rowspan="2">Defect status</th>\n'
+        '          <th colspan="2">Severity</th>\n'
+        '        </tr>\n'
+        '        <tr>\n'
+        '          <th>Highest</th>\n'
+        '          <th>High</th>\n'
+        '        </tr>\n'
+        '      </thead>\n'
+        '      <tbody>\n'
+    )
+    for status_label, key_highest, key_high in mapping:
+        v_h = _safe_int_str(_ci_lookup(jira_data, key_highest))
+        v_high = _safe_int_str(_ci_lookup(jira_data, key_high))
+        frag += f'        <tr><td>{html.escape(status_label)}</td><td>{v_h}</td><td>{v_high}</td></tr>\n'
+    frag += (
+        '      </tbody>\n'
+        '    </table>\n'
+        '  </section>\n'
+        '</div>\n'
+        '<!-- END: Jira Status x Severity table injected by orchestrator.py -->\n'
+    )
+    return frag
+
+def _remove_generated_lines(text: str) -> str:
+    # Remove any line starting with "Generated:" (case-insensitive), including trailing whitespace and newline
+    return re.sub(r"(?mi)^[ \t]*generated:.*(?:\r?\n|$)", "", text)
+
+def _append_fragments_to_html(target_html: Path, fragments: List[str]) -> bool:
+    try:
+        txt = target_html.read_text(encoding="utf-8")
+    except Exception as e:
+        logger.warning("Failed to read %s: %s", target_html, e)
+        return False
+
+    # Remove any "Generated: ..." lines anywhere in the document
+    txt = _remove_generated_lines(txt)
+
+    lower = txt.lower()
+    if "</body>" in lower:
+        orig_idx = lower.rfind("</body>")
+        new_txt = txt[:orig_idx] + ("\n".join(fragments) + "\n") + txt[orig_idx:]
+    else:
+        new_txt = txt + ("\n".join(fragments) + "\n")
+    try:
+        target_html.write_text(new_txt, encoding="utf-8")
+        logger.info("Appended Jira fragments into %s", target_html)
+        return True
+    except Exception as e:
+        logger.warning("Failed to write modified HTML to %s: %s", target_html, e)
+        return False
+
+# -------------------------
+# Main pipeline
+# -------------------------
 def main(argv: List[str] | None = None) -> int:
-    """
-    Orchestrator entrypoint. Runs everything with default paths in the repository root.
-    """
     import argparse
-
-    parser = argparse.ArgumentParser(description="Run full pipeline (omni -> table_milestones -> per-plan charts -> output)")
-    parser.add_argument("--no-charts", action="store_true", help="Skip generating per-plan charts")
-    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    parser = argparse.ArgumentParser(description="Run pipeline and append Jira tables")
+    parser.add_argument("--no-charts", action="store_true")
+    parser.add_argument("--skip-jira", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
 
     logger.setLevel(logging.DEBUG if args.verbose else logging.INFO)
     repo_dir = Path(__file__).resolve().parent
-    results_json = repo_dir / "results.json"
-    output_subdir = repo_dir / "output"
-    output_subdir.mkdir(parents=True, exist_ok=True)
+    output_dir = repo_dir / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) Run omni (writes results.json into repo root)
-    logger.info("Starting omni stage")
+    # 1) omni
     rc = _run_omni()
     if rc != 0:
-        logger.error("omni stage failed with code %s; aborting", rc)
+        logger.error("omni failed: %s", rc)
         return rc
-    logger.info("omni stage completed")
 
-    # 2) Run table_milestones to produce milestone_data.json (next to results.json)
+    # 2) table_milestone
     milestone_path = _run_table_milestone(repo_dir)
 
-    # 3) Discover per-plan JSONs (results_plan_*.json) in repo root
+    # 3) charts
     per_plan_jsons = _discover_per_plan_jsons(repo_dir)
-    if not per_plan_jsons:
-        logger.warning("No per-plan result JSONs found in %s; skipping chart generation", repo_dir)
-    else:
-        logger.info("Discovered %d per-plan JSON file(s): %s", len(per_plan_jsons), ", ".join(p.name for p in per_plan_jsons))
-
-    # 4) Generate per-plan charts unless skipped
     if not args.no_charts and per_plan_jsons:
-        any_failed = False
         for j in per_plan_jsons:
-            rc = _invoke_chart_generator_for_plan_json(j)
-            if rc != 0:
-                any_failed = True
-        if any_failed:
-            logger.warning("Some per-plan chart generation invocations failed; charts may be incomplete")
+            _invoke_chart_generator_for_plan_json(j)
+
+    # 4) table_jira
+    jira_path = repo_dir / "jira_counts.json"
+    if not args.skip_jira:
+        _run_table_jira(repo_dir)
+
+    # 5) output
+    rc_out = _run_output(repo_dir / "results.json", output_dir, milestone_path)
+    if rc_out != 0:
+        logger.error("output failed: %s", rc_out)
+        return rc_out
+
+    # 6) injection: append to the most recent HTML
+    latest = _find_latest_html(output_dir)
+    if not latest:
+        logger.warning("No HTML to inject into; pipeline completed without injection")
+        return 0
+
+    try:
+        jira_data = json.loads(jira_path.read_text(encoding="utf-8")) if jira_path.exists() else {}
+    except Exception:
+        jira_data = {}
+
+    frag1 = _build_defects_count_fragment(jira_data)
+    frag2 = _build_status_severity_fragment(jira_data)
+    success = _append_fragments_to_html(latest, [frag1, frag2])
+    if success:
+        logger.info("Jira tables appended to %s", latest.name)
     else:
-        logger.info("Per-plan chart generation skipped")
-
-    # 5) Run output to assemble final HTML (pass explicit results.json and milestone_data.json)
-    logger.info("Starting output stage")
-    rc2 = _run_output(results_json, output_subdir, milestone_path)
-    if rc2 != 0:
-        logger.error("output stage failed with code %s", rc2)
-        return rc2
-
-    logger.info("Pipeline completed successfully")
+        logger.warning("Failed to append Jira tables to %s", latest.name)
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
